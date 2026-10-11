@@ -14,7 +14,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts/send-sms.py"
 
 
 class SmsTests(unittest.TestCase):
-    def run_sender(self, message="Hello?", password="labpass", reply=None, failure=None):
+    def run_sender(self, message="Hello?", reply=None, failure=None):
         client = MagicMock()
         client.__enter__.return_value = client
         client.send_message.return_value = SimpleNamespace(sequence=7)
@@ -24,7 +24,7 @@ class SmsTests(unittest.TestCase):
         client.read_pdu.side_effect = failure
         out, err = io.StringIO(), io.StringIO()
         arguments = [str(SCRIPT), "123", "100", "10.0.0.251", message]
-        with patch.dict(os.environ, {"SMPP_PASSWORD": password}, clear=True):
+        with patch.dict(os.environ, {}, clear=True):
             with patch.object(smpplib.client, "Client", return_value=client) as factory:
                 with patch("sys.argv", arguments), redirect_stdout(out), redirect_stderr(err):
                     try:
@@ -38,7 +38,7 @@ class SmsTests(unittest.TestCase):
         code, out, client, factory = self.run_sender()
         self.assertEqual(code, 0)
         factory.assert_called_once_with("10.0.0.251", 2775, timeout=10, allow_unknown_opt_params=True)
-        client.bind_transmitter.assert_called_once_with(system_id="sms-client", password="labpass")
+        client.bind_transmitter.assert_called_once_with(system_id="sms-client", password="")
         request = client.send_message.call_args.kwargs
         self.assertEqual(request["destination_addr"], "123")
         self.assertEqual(request["source_addr"], "100")
@@ -52,12 +52,6 @@ class SmsTests(unittest.TestCase):
         self.assertEqual(client.send_message.call_args.kwargs["data_coding"], 8)
         self.assertEqual(client.send_message.call_args.kwargs["short_message"],
                          "Hello \u4f60\u597d".encode("utf-16-be"))
-
-    def test_password_required_before_connecting(self):
-        for password in ("", "123456789"):
-            code, _, _, factory = self.run_sender(password=password)
-            self.assertIn("SMPP_PASSWORD", code)
-            factory.assert_not_called()
 
     def test_rejects_empty_and_multipart_text(self):
         for message in ("", "^" * 81, "\u4f60" * 71):

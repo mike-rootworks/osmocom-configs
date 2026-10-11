@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # Usage: send-sms.py recipient sender server_ip "message"
-import os
 import sys
 import smpplib.client
 import smpplib.exceptions
@@ -10,12 +9,9 @@ if len(sys.argv) != 5:
     sys.exit('Usage: send-sms.py recipient sender server_ip "message"')
 
 recipient, sender, server, message = sys.argv[1:]
-password = os.getenv("SMPP_PASSWORD")
 
 if not recipient.isdigit() or not sender.isdigit():
     sys.exit("Recipient and sender must be phone numbers")
-if not password or len(password) > 8:
-    sys.exit("Set SMPP_PASSWORD to the MSC password (1-8 characters)")
 
 try:
     parts, coding, flags = smpplib.gsm.make_parts(message)
@@ -25,7 +21,7 @@ try:
     with smpplib.client.Client(server, 2775, timeout=10,
                               allow_unknown_opt_params=True) as client:
         client.connect()
-        client.bind_transmitter(system_id="sms-client", password=password)
+        client.bind_transmitter(system_id="sms-client", password="")
         request = client.send_message(
             source_addr=sender, source_addr_ton=0, source_addr_npi=1,
             destination_addr=recipient, dest_addr_ton=0, dest_addr_npi=1,
