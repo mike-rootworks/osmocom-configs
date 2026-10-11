@@ -1,166 +1,87 @@
-"""Exercise SMS validation and fragmented VTY responses without a live MSC."""
-from __future__ import annotations
-
-import argparse
-from collections import deque
-from contextlib import redirect_stderr, redirect_stdout
+"""Offline checks using the real smpplib encoder and a simulated SMPP client."""
 import importlib.util
 import io
+import os
 from pathlib import Path
+from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts/send-sms.py"
-SPEC = importlib.util.spec_from_file_location("send_sms", SCRIPT)
-sms = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(sms)
-
-
-class FakeSocket:
-    def __init__(self, chunks):
-        self.chunks = deque(chunks)
-        self.sent = []
-
-    def recv(self, size):
-        chunk = self.chunks.popleft() if self.chunks else b""
-        if isinstance(chunk, Exception):
-            raise chunk
-        return chunk
-
-    def sendall(self, data):
-        self.sent.append(data)
-
-    def settimeout(self, timeout):
-        self.timeout = timeout
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
+spec = importlib.util.spec_from_file_location(
+    "send_sms", Path(__file__).resolve().parents[1] / "scripts/send-sms.py"
+)
+sms = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sms)
 
 
-class MessageValidationTests(unittest.TestCase):
-    def test_gsm_extension_characters_use_two_septets(self):
-        self.assertEqual(sms.sms_text("^" * 80), "^" * 80)
-        with self.assertRaises(argparse.ArgumentTypeError):
-            sms.sms_text("^" * 81)
-        self.assertEqual(sms.sms_text("a" * 160), "a" * 160)
-        with self.assertRaises(argparse.ArgumentTypeError):
-            sms.sms_text("a" * 161)
-
-    def test_unsafe_or_unrepresentable_text_is_rejected(self):
-        for value in ("", "  ", "Hello\nshutdown", "Hi\rshutdown", "Tab\there",
-                      "Emoji \U0001f600", "Hello?", "`code`", "\x1b[31mtext"):
-            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
-                sms.sms_text(value)
-
-    def test_spaces_are_normalized_and_percent_is_literal(self):
-        self.assertEqual(sms.sms_text("  Battery   50%  "), "Battery 50%")
-
-    def test_numbers_preserve_leading_zeroes_and_reject_injection(self):
-        self.assertEqual(sms.number("+00123"), "00123")
-        for value in ("", "12 34", "1\nshutdown", "abc", "9" * 16, "\u0661\u0662"):
-            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
-                sms.number(value)
-
-    def test_invalid_timeouts_and_ports_are_rejected(self):
-        for value in ("nan", "inf", "0", "-1"):
-            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
-                sms.timeout_seconds(value)
-        for value in ("0", "65536", "abc"):
-            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
-                sms.port_number(value)
-
-
-class VtyProtocolTests(unittest.TestCase):
-    def run_cli(self, connection, arguments=None):
+class SmsTests(unittest.TestCase):
+    def run_sender(self, message="Hello?", password="labpass", failure=None):
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.send_message.return_value = SimpleNamespace(sequence=7)
+        client.read_once.side_effect = failure or (
+            lambda **kwargs: client.set_message_sent_handler.call_args.args[0](
+                SimpleNamespace(sequence=7)
+            )
+        )
         out, err = io.StringIO(), io.StringIO()
-        with patch.object(sms.socket, "create_connection", return_value=connection) as connect:
-            with redirect_stdout(out), redirect_stderr(err):
-                result = sms.main(arguments or ["--to", "123", "--message", "Hello"])
-        return result, out.getvalue(), err.getvalue(), connect
+        with patch.dict(os.environ, {"SMPP_PASSWORD": password}, clear=True):
+            with patch.object(sms.smpplib.client, "Client", return_value=client) as factory:
+                with redirect_stdout(out), redirect_stderr(err):
+                    try:
+                        sms.main(["123", "100", message])
+                        code = 0
+                    except SystemExit as error:
+                        code = error.code
+        return code, out.getvalue(), err.getvalue(), client, factory
 
-    def test_fragmented_telnet_negotiation_and_command_echo(self):
-        connection = FakeSocket([
-            b"\xff", b"\xfb\x01\xff\xfd", b"\x1f\xff\xfa\x1f\x00\x50\xff",
-            b"\xf0Welcome\r\nOsmo", b"MSC> ",
-            b"enable\r\nOsmoMSC", b"# ",
-            b"subscriber msisdn 123 sms sender msisdn 100 send Battery 50%\r\n",
-            b"OsmoMSC# ",
-        ])
-        result, out, err, connect = self.run_cli(
-            connection, ["--to", "123", "--message", "Battery 50%"]
-        )
-        self.assertEqual(result, 0, err)
-        self.assertIn("Storage and handset delivery are not confirmed", out)
-        self.assertIn(b"\xff\xfd\x01", connection.sent)  # DO ECHO
-        self.assertIn(b"\xff\xfc\x1f", connection.sent)  # WONT NAWS
-        self.assertIn(b"enable\r", connection.sent)
-        self.assertEqual(connection.sent[-1],
-                         b"subscriber msisdn 123 sms sender msisdn 100 send Battery 50%\r")
-        connect.assert_called_once_with(("127.0.0.1", 4254), timeout=10.0)
+    def test_success_waits_for_submit_response(self):
+        code, out, _, client, factory = self.run_sender()
+        self.assertEqual(code, 0)
+        factory.assert_called_once_with("127.0.0.1", 2775, timeout=10, allow_unknown_opt_params=True)
+        client.bind_transmitter.assert_called_once_with(system_id="sms-client", password="labpass")
+        request = client.send_message.call_args.kwargs
+        self.assertEqual(request["destination_addr"], "123")
+        self.assertEqual(request["source_addr"], "100")
+        self.assertEqual(request["short_message"], b"Hello?")
+        client.read_once.assert_called_once_with(auto_send_enquire_link=False)
+        self.assertIn("handset delivery is not confirmed", out)
 
-    def test_unknown_recipient_is_an_error(self):
-        connection = FakeSocket([
-            b"OsmoMSC# ",
-            b"subscriber msisdn 123 sms sender msisdn 100 send Hello\r\n"
-            b"% No subscriber found for msisdn 123\r\nOsmoMSC# ",
-        ])
-        result, out, err, _ = self.run_cli(connection)
-        self.assertEqual(result, 1)
-        self.assertIn("No subscriber found", err)
-        self.assertNotIn("SMS command submitted", out)
+    def test_unicode_uses_ucs2(self):
+        code, _, _, client, _ = self.run_sender("Hello \u03a9 \u4f60\u597d")
+        self.assertEqual(code, 0)
+        self.assertEqual(client.send_message.call_args.kwargs["data_coding"], 8)
+        self.assertEqual(client.send_message.call_args.kwargs["short_message"],
+                         "Hello \u03a9 \u4f60\u597d".encode("utf-16-be"))
 
-    def test_authenticated_vty_fails_before_sms(self):
-        for greeting in (b"Password: ", b"Username: "):
-            with self.subTest(greeting=greeting):
-                connection = FakeSocket([greeting])
-                result, _, err, _ = self.run_cli(connection)
-                self.assertEqual(result, 1)
-                self.assertIn("authentication", err)
-                self.assertEqual(connection.sent, [])
+    def test_missing_or_overlength_password_does_not_connect(self):
+        for password in ("", "123456789"):
+            with self.subTest(password=password):
+                code, _, _, _, factory = self.run_sender(password=password)
+                self.assertEqual(code, 2)
+                factory.assert_not_called()
 
-    def test_enable_password_fails_before_sms(self):
-        connection = FakeSocket([b"OsmoMSC> ", b"Password: "])
-        result, _, err, _ = self.run_cli(connection)
-        self.assertEqual(result, 1)
-        self.assertIn("authentication", err)
-        self.assertEqual(connection.sent, [b"enable\r"])
+    def test_multipart_and_empty_text_are_rejected(self):
+        for message in ("", "^" * 81, "\u4f60" * 71, "x" * 161):
+            with self.subTest(length=len(message)):
+                code, _, _, _, factory = self.run_sender(message)
+                self.assertEqual(code, 2)
+                factory.assert_not_called()
 
-    def test_timeout_after_sms_does_not_retry(self):
-        connection = FakeSocket([b"OsmoMSC# ", TimeoutError("timeout")])
-        result, _, err, connect = self.run_cli(connection)
-        self.assertEqual(result, 1)
-        self.assertIn("Submission outcome is unknown", err)
-        self.assertEqual(len(connection.sent), 1)
-        connect.assert_called_once()
+    def test_smpp_rejection_does_not_report_success(self):
+        error = sms.smpplib.exceptions.PDUError("Invalid destination", 11)
+        code, out, _, client, _ = self.run_sender(failure=error)
+        self.assertIn("SMPP error", code)
+        self.assertNotIn("SMS accepted", out)
+        client.send_message.assert_called_once()
+        client.__exit__.assert_called_once()
 
-    def test_disconnection_after_sms_reports_uncertain_outcome(self):
-        connection = FakeSocket([b"OsmoMSC# ", b""])
-        result, _, err, _ = self.run_cli(connection)
-        self.assertEqual(result, 1)
-        self.assertIn("Submission outcome is unknown", err)
-
-    def test_imsi_target_and_custom_endpoint(self):
-        connection = FakeSocket([b"OsmoMSC# ", b"\r\nOsmoMSC# "])
-        result, _, err, connect = self.run_cli(connection, [
-            "--imsi", "001010123456789", "--sender", "+100", "--message", "Hello",
-            "--host", "localhost", "--port", "14254", "--timeout", "2",
-        ])
-        self.assertEqual(result, 0, err)
-        self.assertEqual(connection.sent, [
-            b"subscriber imsi 001010123456789 sms sender msisdn 100 send Hello\r"
-        ])
-        connect.assert_called_once_with(("localhost", 14254), timeout=2.0)
-
-    def test_dry_run_never_connects(self):
-        result, out, err, connect = self.run_cli(
-            FakeSocket([]), ["--to", "123", "--message", "Hello", "--dry-run"]
-        )
-        self.assertEqual(result, 0, err)
-        self.assertIn("subscriber msisdn 123", out)
-        connect.assert_not_called()
+    def test_timeout_does_not_resubmit(self):
+        code, out, _, client, _ = self.run_sender(failure=TimeoutError("timeout"))
+        self.assertIn("Check MSC logs before retrying", code)
+        self.assertNotIn("SMS accepted", out)
+        client.send_message.assert_called_once()
 
 
 if __name__ == "__main__":
