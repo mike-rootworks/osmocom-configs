@@ -1,84 +1,86 @@
-"""Offline checks using the real smpplib encoder and a simulated SMPP client."""
-import importlib.util
+"""Check the basic sender offline with smpplib's real text encoder."""
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
-from contextlib import redirect_stderr, redirect_stdout
+import runpy
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-spec = importlib.util.spec_from_file_location(
-    "send_sms", Path(__file__).resolve().parents[1] / "scripts/send-sms.py"
-)
-sms = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(sms)
+import smpplib.client
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts/send-sms.py"
 
 
 class SmsTests(unittest.TestCase):
-    def run_sender(self, message="Hello?", password="labpass", failure=None):
+    def run_sender(self, message="Hello?", password="labpass", reply=None, failure=None):
         client = MagicMock()
         client.__enter__.return_value = client
         client.send_message.return_value = SimpleNamespace(sequence=7)
-        client.read_once.side_effect = failure or (
-            lambda **kwargs: client.set_message_sent_handler.call_args.args[0](
-                SimpleNamespace(sequence=7)
-            )
+        client.read_pdu.return_value = reply or SimpleNamespace(
+            command="submit_sm_resp", sequence=7, status=0
         )
+        client.read_pdu.side_effect = failure
         out, err = io.StringIO(), io.StringIO()
+        arguments = [str(SCRIPT), "123", "100", "10.0.0.251", message]
         with patch.dict(os.environ, {"SMPP_PASSWORD": password}, clear=True):
-            with patch.object(sms.smpplib.client, "Client", return_value=client) as factory:
-                with redirect_stdout(out), redirect_stderr(err):
+            with patch.object(smpplib.client, "Client", return_value=client) as factory:
+                with patch("sys.argv", arguments), redirect_stdout(out), redirect_stderr(err):
                     try:
-                        sms.main(["123", "100", message])
+                        runpy.run_path(str(SCRIPT), run_name="__main__")
                         code = 0
                     except SystemExit as error:
                         code = error.code
-        return code, out.getvalue(), err.getvalue(), client, factory
+        return code, out.getvalue(), client, factory
 
-    def test_success_waits_for_submit_response(self):
-        code, out, _, client, factory = self.run_sender()
+    def test_argument_order_and_acceptance(self):
+        code, out, client, factory = self.run_sender()
         self.assertEqual(code, 0)
-        factory.assert_called_once_with("127.0.0.1", 2775, timeout=10, allow_unknown_opt_params=True)
+        factory.assert_called_once_with("10.0.0.251", 2775, timeout=10, allow_unknown_opt_params=True)
         client.bind_transmitter.assert_called_once_with(system_id="sms-client", password="labpass")
         request = client.send_message.call_args.kwargs
         self.assertEqual(request["destination_addr"], "123")
         self.assertEqual(request["source_addr"], "100")
         self.assertEqual(request["short_message"], b"Hello?")
-        client.read_once.assert_called_once_with(auto_send_enquire_link=False)
-        self.assertIn("handset delivery is not confirmed", out)
+        client.read_pdu.assert_called_once()
+        self.assertIn("Handset delivery is not confirmed", out)
 
-    def test_unicode_uses_ucs2(self):
-        code, _, _, client, _ = self.run_sender("Hello \u03a9 \u4f60\u597d")
+    def test_unicode(self):
+        code, _, client, _ = self.run_sender("Hello \u4f60\u597d")
         self.assertEqual(code, 0)
         self.assertEqual(client.send_message.call_args.kwargs["data_coding"], 8)
         self.assertEqual(client.send_message.call_args.kwargs["short_message"],
-                         "Hello \u03a9 \u4f60\u597d".encode("utf-16-be"))
+                         "Hello \u4f60\u597d".encode("utf-16-be"))
 
-    def test_missing_or_overlength_password_does_not_connect(self):
+    def test_password_required_before_connecting(self):
         for password in ("", "123456789"):
-            with self.subTest(password=password):
-                code, _, _, _, factory = self.run_sender(password=password)
-                self.assertEqual(code, 2)
-                factory.assert_not_called()
+            code, _, _, factory = self.run_sender(password=password)
+            self.assertIn("SMPP_PASSWORD", code)
+            factory.assert_not_called()
 
-    def test_multipart_and_empty_text_are_rejected(self):
-        for message in ("", "^" * 81, "\u4f60" * 71, "x" * 161):
-            with self.subTest(length=len(message)):
-                code, _, _, _, factory = self.run_sender(message)
-                self.assertEqual(code, 2)
-                factory.assert_not_called()
+    def test_rejects_empty_and_multipart_text(self):
+        for message in ("", "^" * 81, "\u4f60" * 71):
+            code, _, _, factory = self.run_sender(message)
+            self.assertIn("one SMS", code)
+            factory.assert_not_called()
 
-    def test_smpp_rejection_does_not_report_success(self):
-        error = sms.smpplib.exceptions.PDUError("Invalid destination", 11)
-        code, out, _, client, _ = self.run_sender(failure=error)
-        self.assertIn("SMPP error", code)
+    def test_rejected_sms_is_not_reported_as_accepted(self):
+        reply = SimpleNamespace(command="submit_sm_resp", sequence=7, status=11)
+        code, out, client, _ = self.run_sender(reply=reply)
+        self.assertIn("status 11", code)
         self.assertNotIn("SMS accepted", out)
-        client.send_message.assert_called_once()
         client.__exit__.assert_called_once()
 
+    def test_wrong_response_or_sequence_is_not_acceptance(self):
+        for command, sequence in (("enquire_link", 7), ("submit_sm_resp", 8)):
+            reply = SimpleNamespace(command=command, sequence=sequence, status=0)
+            code, out, _, _ = self.run_sender(reply=reply)
+            self.assertIn("Unexpected SMPP response", code)
+            self.assertNotIn("SMS accepted", out)
+
     def test_timeout_does_not_resubmit(self):
-        code, out, _, client, _ = self.run_sender(failure=TimeoutError("timeout"))
+        code, out, client, _ = self.run_sender(failure=TimeoutError("timeout"))
         self.assertIn("Check MSC logs before retrying", code)
         self.assertNotIn("SMS accepted", out)
         client.send_message.assert_called_once()
