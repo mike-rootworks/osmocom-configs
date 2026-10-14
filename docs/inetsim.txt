@@ -1,0 +1,41 @@
+
+For your native lab, the config bundle uses laptop address 10.0.0.251 and handset address pool 172.16.23.0/24. If those still match your install, you can try this:
+
+1. Install INetSim and tcpdump:
+
+sudo apt update
+sudo apt install inetsim tcpdump
+
+   Ubuntu 26.04 provides an inetsim package. Ubuntu package listing
+2. Edit /etc/inetsim/inetsim.conf. Set the service address and fake DNS answer to the laptop’s lab address, and enable DNS and web services:
+
+service_bind_address 10.0.0.251
+dns_default_ip 10.0.0.251
+start_service dns
+start_service http
+start_service https
+create_reports YES
+
+If those start_service lines are already present, make sure they aren’t commented out. INetSim documents these settings and stores logs/reports under /var/log/inetsim/ by default. INetSim configuration reference, Ubuntu INetSim manual
+
+
+3. The lab’s firewall blocks GPRS handsets from reaching services on the laptop by default. After starting the lab, add temporary rules to allow INetSim’s DNS and web ports, and block handset forwarding to the real internet:
+
+sudo iptables -I OSMOLAB-IN 1 -i tun-osmo -s 172.16.23.0/24 -d 10.0.0.251 -p udp --dport 53 -j ACCEPT
+sudo iptables -I OSMOLAB-IN 1 -i tun-osmo -s 172.16.23.0/24 -d 10.0.0.251 -p tcp -m multiport --dports 53,80,443 -j ACCEPT
+sudo iptables -I OSMOLAB-FWD 1 -i tun-osmo -s 172.16.23.0/24 -j DROP
+
+   These rules are temporary and will be cleared when the lab firewall is rebuilt or the lab restarts.
+
+4. In /etc/osmocom-lab/osmo-ggsn.cfg, change both ip dns entries to 10.0.0.251, then restart GGSN and INetSim:
+
+sudo systemctl restart osmocom-lab-osmo-ggsn.service
+sudo systemctl restart inetsim
+sudo systemctl status inetsim --no-pager
+
+
+5. Start a capture, use mobile data on the handset, then press Ctrl+C to finish:
+
+sudo tcpdump -i tun-osmo -nn -s0 -w /tmp/gprs.pcap
+
+Open /tmp/gprs.pcap in Wireshark. Check INetSim’s activity and reports under /var/log/inetsim/.
