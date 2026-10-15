@@ -57,7 +57,7 @@ def validate_directory(directory):
                          f'Use --directory {SNAP_DIRECTORY}; no files were moved automatically')
 
 DOCKERFILE = '''FROM ubuntu:26.04
-ARG CHANNEL=nightly
+ARG CHANNEL=latest
 ENV DEBIAN_FRONTEND=noninteractive
 RUN case "$CHANNEL" in nightly|latest) ;; *) exit 1 ;; esac && \\
     apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg iproute2 sqlite3 && \\

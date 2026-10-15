@@ -59,7 +59,7 @@ class Settings:
     registration: str = 'open'
     unknown_apns: bool = True
     internet: bool = True
-    channel: str = 'nightly'
+    channel: str = 'latest'
     rf_locked: bool = False
     gprs_mode: str = 'egprs'
     welcome_sms: bool = False
@@ -215,6 +215,8 @@ def welcome_monitor() -> None:
 
 def render(s: Settings) -> dict[str, str]:
     s.validate()
+    if s.registration == 'open' and s.channel == 'nightly':
+        raise ValueError('Open packet registration requires --channel latest; the current nightly SGSN no longer implements accept-all')
     common = '''log stderr
  logging filter all 1
  logging color 0
@@ -233,6 +235,9 @@ ctrl
 '''
     auto = '' if s.registration == 'closed' else f' subscriber-create-on-demand 3 {"none" if s.registration == "observe" else "cs+ps"}\n'
     wildcard = '   profile 2\n    apn *\n' if s.unknown_apns else ''
+    packet_policy = 'accept-all' if s.registration == 'open' else 'remote'
+    packet_apn = '*' if s.unknown_apns else 'internet'
+    packet_mapping = f' apn {packet_apn} ggsn 0\n' if s.registration == 'open' else ''
     files = {}
     files['osmo-stp'] = common.replace('ctrl\n bind 127.0.0.1\n!\n', '') + '''cs7 instance 0
  xua rkm routing-key-allocation dynamic-permitted
@@ -292,8 +297,6 @@ smsc
 network
  network country code {s.mcc}
  mobile network code {s.mnc}
- short name {s.name}
- long name {s.name}
  encryption a5 0
  neci 1
  paging any use tch 0
@@ -350,10 +353,12 @@ bsc
  ggsn 0 gtp-version 1
  ggsn 0 echo-interval 60
  authentication optional
- auth-policy remote
+ auth-policy {packet_policy}
+ encryption gea 0
+ gsup ipa-name SGSN-GSMLab
  gsup remote-ip 127.0.0.1
  gsup remote-port 4222
-ns
+{packet_mapping}ns
  bind udp local
   listen {s.lan_ip} 23000
   accept-ipaccess
@@ -564,6 +569,8 @@ def change_rf(locked: bool):
 
 
 def preflight(s: Settings, replace: bool, native: bool = True):
+    # Reject unsupported config/package combinations before stopping the lab.
+    render(s)
     os_release = dict(line.strip().split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
     if os_release.get('ID', '').strip('"') != 'ubuntu' or os_release.get('VERSION_ID', '').strip('"') != '26.04':
         raise ValueError('This installer supports Ubuntu 26.04 only; no cross-distribution package fallback')
@@ -657,9 +664,11 @@ def install(s: Settings, replace: bool, start: bool):
             run('gpg', '--batch', '--yes', '--dearmor', '--output', key, ascii_key)
         key.chmod(0o644)
         Path('/etc/apt/sources.list.d/osmocom-lab.list').write_text(f'deb [signed-by={key}] {repo} /\n')
-        Path('/etc/apt/preferences.d/osmocom-lab').write_text('Package: *\nPin: origin downloads.osmocom.org\nPin-Priority: 700\n')
+        # Select this feed even when a separate nightly source is present.
+        # Priority > 1000 also allows replacement of newer nightly packages.
+        APT_PREFERENCES.write_text(f'Package: *\nPin: release l=osmocom:{s.channel}\nPin-Priority: 1001\n')
         run('apt-get', 'update')
-        run('apt-get', 'install', '-y', '--no-install-recommends',
+        run('apt-get', 'install', '-y', '--allow-downgrades', '--no-install-recommends',
             *SHARED_RUNTIME_PACKAGES, *PACKAGES)
     finally:
         policy.unlink(missing_ok=True)
@@ -795,7 +804,8 @@ def add_settings_arguments(p, welcome_sms=False):
     rf.add_argument('--rf-disable', dest='rf_locked', action='store_true',
                     help='Generate an RF-locked config')
     p.set_defaults(rf_locked=False)
-    p.add_argument('--channel', choices=('nightly', 'latest'), default='nightly')
+    p.add_argument('--channel', choices=('nightly', 'latest'), default='latest',
+                   help='Osmocom package feed (default: latest stable; required for open packet registration)')
 
 
 def main(argv=None):
@@ -814,6 +824,7 @@ def main(argv=None):
         p = sub.add_parser(command, aliases={'rf-on': ['rf-enable'], 'rf-off': ['rf-disable']}.get(command, []))
         if command == 'rf-on':
             p.add_argument('--confirm', help='Legacy compatibility option; confirmation is no longer required')
+    sub.add_parser('open-registration', help='Reinstall the existing native lab on the stable feed with unauthenticated CS/PS registration; retain settings and databases')
     sub.add_parser('welcome-monitor', help=argparse.SUPPRESS)
     p = sub.add_parser('uninstall', help='Remove the native lab; back up configs and retain databases by default')
     p.add_argument('--purge-data', action='store_true', help='Delete lab configs and subscriber/SMS databases without a new backup')
@@ -833,6 +844,10 @@ def main(argv=None):
         raise ValueError('This command requires root (sudo); render does not')
     if args.command == 'install':
         install(settings_from_args(args), args.replace, args.start)
+    elif args.command == 'open-registration':
+        saved = Settings(**json.loads((CONFIG / 'settings.json').read_text()))
+        install(dataclasses.replace(saved, registration='open', channel='latest').validate(),
+                replace=True, start=True)
     elif args.command == 'uninstall':
         uninstall(args.purge_data, args.keep_packages)
     elif args.command in ('firewall-up', 'firewall-down'):
